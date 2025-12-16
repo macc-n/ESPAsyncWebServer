@@ -32,7 +32,8 @@ enum {
 AsyncWebServerRequest::AsyncWebServerRequest(AsyncWebServer *s, AsyncClient *c)
   : _client(c), _server(s), _handler(NULL), _response(NULL), _onDisconnectfn(NULL), _temp(), _parseState(PARSE_REQ_START), _version(0), _method(HTTP_ANY),
     _url(), _host(), _contentType(), _boundary(), _authorization(), _reqconntype(RCT_HTTP), _authMethod(AsyncAuthType::AUTH_NONE), _isMultipart(false),
-    _isPlainPost(false), _expectingContinue(false), _contentLength(0), _parsedLength(0), _multiParseState(0), _boundaryPosition(0), _itemStartIndex(0),
+    _isPlainPost(false), _expectingContinue(false), _contentLength(0), _parsedLength(0), _chunked(false), _chunkState(0), _chunkSize(0), _chunkBytesRead(0),
+    _multiParseState(0), _boundaryPosition(0), _itemStartIndex(0),
     _itemSize(0), _itemName(), _itemFilename(), _itemType(), _itemValue(), _itemBuffer(0), _itemBufferIndex(0), _itemIsFile(false), _tempObject(NULL) {
   c->onError(
     [](void *r, AsyncClient *c, int8_t error) {
@@ -164,59 +165,138 @@ void AsyncWebServerRequest::_onData(void *buf, size_t len) {
         }
       }
     } else if (_parseState == PARSE_REQ_BODY) {
-      // A handler should be already attached at this point in _parseLine function.
-      // If handler does nothing (_onRequest is NULL), we don't need to really parse the body.
-      const bool needParse = _handler && !_handler->isRequestHandlerTrivial();
-      // Discard any bytes after content length; handlers may overrun their buffers
-      len = std::min(len, _contentLength - _parsedLength);
-      if (_isMultipart) {
-        if (needParse) {
-          size_t i;
-          for (i = 0; i < len; i++) {
-            _parseMultipartPostByte(((uint8_t *)buf)[i], i == len - 1);
-            _parsedLength++;
+      if (_chunked) {
+        while (len > 0) {
+          if (_chunkState == 0) {  // Expect chunk size
+            char *str = (char *)buf;
+            size_t j;
+            for (j = 0; j < len; j++) {
+              if (str[j] == '\n')
+                break;
+            }
+            if (j == len) {  // No CRLF yet
+              char ch = str[len - 1];
+              str[len - 1] = 0;
+              _temp.concat(str);
+              _temp.concat(ch);
+              str[len - 1] = ch;  // Restore
+              return;
+            }
+            // Found CRLF
+            char ch = str[j];
+            str[j] = 0;
+            _temp.concat(str);
+            _temp.trim();
+            char *endptr;
+            _chunkSize = strtoul(_temp.c_str(), &endptr, 16);
+            _temp = "";
+            _chunkBytesRead = 0;
+
+            // Restore char for safety (though we move pointer)
+            str[j] = ch;
+
+            buf = (uint8_t *)buf + j + 1;
+            len -= (j + 1);
+
+            if (_chunkSize == 0) {
+              _chunkState = 3;  // End of chunks
+            } else {
+              _chunkState = 1;  // Read chunk data
+            }
+          } else if (_chunkState == 1) {  // Read chunk data
+            size_t toRead = std::min(len, _chunkSize - _chunkBytesRead);
+            _handleBodyData(buf, toRead);
+            _chunkBytesRead += toRead;
+            buf = (uint8_t *)buf + toRead;
+            len -= toRead;
+
+            if (_chunkBytesRead == _chunkSize) {
+              _chunkState = 2;  // Expect CRLF
+            }
+          } else if (_chunkState == 2) {  // Expect CRLF after data
+            char *str = (char *)buf;
+            size_t j;
+            for (j = 0; j < len; j++) {
+              if (str[j] == '\n') {
+                _chunkState = 0;  // Next chunk
+                buf = (uint8_t *)buf + j + 1;
+                len -= (j + 1);
+                break;
+              }
+            }
+            if (_chunkState == 2) {
+              // consumed all len but no \n
+              return;
+            }
+          } else if (_chunkState == 3) {  // Finished
+            // Consume trailing headers if any, until empty line
+            // For now, assume we just finish
+            _parseState = PARSE_REQ_END;
+            _runMiddlewareChain();
+            _send();
+            return;
           }
-        } else {
-          _parsedLength += len;
         }
       } else {
-        if (_parsedLength == 0) {
-          if (_contentType.startsWith(T_app_xform_urlencoded)) {
-            _isPlainPost = true;
-          } else if (_contentType == T_text_plain && isParamChar(((char *)buf)[0])) {
-            size_t i = 0;
-            char ch;
-            do {
-              ch = ((char *)buf)[i];
-            } while (i++ < len && isParamChar(ch));
-            if (i < len && ((char *)buf)[i - 1] == '=') {
-              _isPlainPost = true;
-            }
-          }
+        // Discard any bytes after content length; handlers may overrun their buffers
+        len = std::min(len, _contentLength - _parsedLength);
+        _handleBodyData(buf, len);
+        if (_parsedLength == _contentLength) {
+          _parseState = PARSE_REQ_END;
+          _runMiddlewareChain();
+          _send();
         }
-        if (!_isPlainPost) {
-          // ESP_LOGD("AsyncWebServer", "_isPlainPost: %d, _handler: %p", _isPlainPost, _handler);
-          if (_handler) {
-            _handler->handleBody(this, (uint8_t *)buf, len, _parsedLength, _contentLength);
-          }
-          _parsedLength += len;
-        } else if (needParse) {
-          size_t i;
-          for (i = 0; i < len; i++) {
-            _parsedLength++;
-            _parsePlainPostChar(((uint8_t *)buf)[i]);
-          }
-        } else {
-          _parsedLength += len;
-        }
-      }
-      if (_parsedLength == _contentLength) {
-        _parseState = PARSE_REQ_END;
-        _runMiddlewareChain();
-        _send();
       }
     }
     break;
+  }
+}
+
+void AsyncWebServerRequest::_handleBodyData(void *buf, size_t len) {
+  // A handler should be already attached at this point in _parseLine function.
+  // If handler does nothing (_onRequest is NULL), we don't need to really parse the body.
+  const bool needParse = _handler && !_handler->isRequestHandlerTrivial();
+
+  if (_isMultipart) {
+    if (needParse) {
+      size_t i;
+      for (i = 0; i < len; i++) {
+        _parseMultipartPostByte(((uint8_t *)buf)[i], i == len - 1);
+        _parsedLength++;
+      }
+    } else {
+      _parsedLength += len;
+    }
+  } else {
+    if (_parsedLength == 0) {
+      if (_contentType.startsWith(T_app_xform_urlencoded)) {
+        _isPlainPost = true;
+      } else if (_contentType == T_text_plain && isParamChar(((char *)buf)[0])) {
+        size_t i = 0;
+        char ch;
+        do {
+          ch = ((char *)buf)[i];
+        } while (i++ < len && isParamChar(ch));
+        if (i < len && ((char *)buf)[i - 1] == '=') {
+          _isPlainPost = true;
+        }
+      }
+    }
+    if (!_isPlainPost) {
+      // ESP_LOGD("AsyncWebServer", "_isPlainPost: %d, _handler: %p", _isPlainPost, _handler);
+      if (_handler) {
+        _handler->handleBody(this, (uint8_t *)buf, len, _parsedLength, _contentLength);
+      }
+      _parsedLength += len;
+    } else if (needParse) {
+      size_t i;
+      for (i = 0; i < len; i++) {
+        _parsedLength++;
+        _parsePlainPostChar(((uint8_t *)buf)[i]);
+      }
+    } else {
+      _parsedLength += len;
+    }
   }
 }
 
@@ -350,6 +430,8 @@ bool AsyncWebServerRequest::_parseReqHeader() {
       }
     } else if (name.equalsIgnoreCase(T_Content_Length)) {
       _contentLength = atoi(value.c_str());
+    } else if (name.equalsIgnoreCase(T_Transfer_Encoding) && value.equalsIgnoreCase(T_chunked)) {
+      _chunked = true;
     } else if (name.equalsIgnoreCase(T_EXPECT) && value.equalsIgnoreCase(T_100_CONTINUE)) {
       _expectingContinue = true;
     } else if (name.equalsIgnoreCase(T_AUTH)) {
@@ -680,7 +762,7 @@ void AsyncWebServerRequest::_parseLine() {
         String response(T_HTTP_100_CONT);
         _client->write(response.c_str(), response.length());
       }
-      if (_contentLength) {
+      if (_contentLength || _chunked) {
         _parseState = PARSE_REQ_BODY;
       } else {
         _parseState = PARSE_REQ_END;

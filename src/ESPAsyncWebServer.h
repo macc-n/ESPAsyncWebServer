@@ -259,6 +259,10 @@ private:
   bool _expectingContinue;
   size_t _contentLength;
   size_t _parsedLength;
+  bool _chunked;
+  int _chunkState;
+  size_t _chunkSize;
+  size_t _chunkBytesRead;
 
   std::list<AsyncWebHeader> _headers;
   std::list<AsyncWebParameter> _params;
@@ -286,6 +290,7 @@ private:
   void _onTimeout(uint32_t time);
   void _onDisconnect();
   void _onData(void *buf, size_t len);
+  void _handleBodyData(void *buf, size_t len);
 
   bool _parseReqHead();
   bool _parseReqHeader();
